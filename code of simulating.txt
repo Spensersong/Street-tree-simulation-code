@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+"""Generate the 56,160-row modified urban-tree wind-failure simulation.
+
+The user supplied the factorial design, tree heights, original simulation code,
+the previous CSV layout, and two model PDFs.  This implementation intentionally
+keeps the non-root numerical conventions of the supplied code while applying
+the revised root coefficients and the corrected resistance sequence around
+equations (30)-(33) of ``1-3 spenser(1).pdf``.
+
+Rain treatment used for the baseline table:
+    F_root = (F_taproot + F_lateral) * k_wet
+    M_33   = M_root + M_weight
+
+Equation (29)'s ``f_m`` lookup is a separate Fan (2022) sensitivity scenario,
+not an additional baseline multiplier after equation (30)'s ``k_wet``.  The
+``f_m`` column is retained to preserve the requested reference CSV schema, but
+it is not applied in this baseline calibration.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+from collections import OrderedDict
+from pathlib import Path
+
+
+RHO_AIR = 1.225
+GRAVITY = 9.8
+ETA_I0 = 0.80
+SIGMA_B0 = 110.0e6
+
+GUST_AMPLIFICATION_FACTOR = 1.5
+GUST_PEAK_8LEVEL = 17.2
+THRESHOLD_MEAN = GUST_PEAK_8LEVEL / GUST_AMPLIFICATION_FACTOR
+
+KSHEAR = 1.10
+KSYN_OPEN = 1.45
+KSYN_PAVED = 1.00
+LATERAL_ROOT_DIAMETER_MIN_MM = 20.0
+LATERAL_ROOT_DIAMETER_MAX_MM = 40.0
+CROWN_MASS_ALLOMETRY_A = 0.12
+CROWN_MASS_ALLOMETRY_B = 2.18
+
+
+def original_species(
+    dh: dict,
+    dc: dict,
+    lai: float,
+    kcrown: float,
+    beta: float,
+    rho_g: float,
+    tree_type: str,
+    heights: list[float],
+    root_depth: float,
+    n_side: int,
+    root_radius: float,
+) -> dict:
+    return {
+        "dh": dh,
+        "dc": dc,
+        "LAI": lai,
+        "kcrown": kcrown,
+        "beta": beta,
+        "rho_g": rho_g,
+        "type": tree_type,
+        "H_list": heights,
+        "root": {
+            "root_depth": root_depth,
+            "n_side": n_side,
+            "R_root": root_radius,
+            "L_eff_ratio": 0.60,
+        },
+    }
+
+
+# Species order follows the user's latest list.  The 12 supplied species retain
+# the uploaded code's DBH/crown regressions and mechanical inputs.  White ash
+# was missing from that code; its geometry uses the published 95th-quantile
+# Fraxinus chinensis equations ln(H)=0.3157+0.5624ln(DBH) and
+# ln(CW)=-0.0204+0.7253ln(DBH).  Its remaining mechanical/root inputs are the
+# medians of the uploaded broad-leaved species and are recorded in the audit.
+TREE_PARAMS = OrderedDict(
+    [
+        (
+            "雪松",
+            original_species(
+                {"type": "power", "a": 4.874, "b": 0.814},
+                {"type": "power", "a": 3.320, "b": 1.067},
+                3.0,
+                0.70,
+                0.012,
+                420,
+                "针叶",
+                [5, 8, 11, 14],
+                0.60,
+                8,
+                1.35,
+            ),
+        ),
+        (
+            "油松",
+            original_species(
+                {"type": "linear", "a": 0.773, "b": 9.606},
+                {"type": "quadratic", "a": -0.151, "b": 2.595, "c": 8.604},
+                2.8,
+                0.68,
+                0.012,
+                470,
+                "针叶",
+                [3, 5, 7, 8],
+                0.65,
+                9,
+                1.40,
+            ),
+        ),
+        (
+            "圆柏",
+            original_species(
+                {"type": "linear", "a": 1.682, "b": 3.452},
+                {"type": "log", "a": 5.017, "b": 10.444},
+                3.2,
+                0.65,
+                0.012,
+                490,
+                "针叶",
+                [5, 7, 9, 11],
+                0.58,
+                8,
+                1.30,
+            ),
+        ),
+        (
+            "核桃",
+            original_species(
+                {"type": "power", "a": 12.078, "b": 0.167},
+                {"type": "quadratic", "a": 0.089, "b": 1.007, "c": 8.737},
+                2.1,
+                0.72,
+                0.009,
+                580,
+                "阔叶",
+                [5, 8, 11, 14],
+                0.70,
+                9,
+                1.50,
+            ),
+        ),
+        (
+            "臭椿",
+            original_species(
+                {"type": "power", "a": 1.023, "b": 1.262},
+                {"type": "linear", "a": 2.694, "b": 1.825},
+                1.8,
+                0.70,
+                0.009,
+                540,
+                "阔叶",
+                [5, 8, 11, 14],
+                0.62,
+                8,
+                1.45,
+            ),
+        ),
+        (
+            "火炬树",
+            original_species(
+                {"type": "linear", "a": 0.937, "b": 4.038},
+                {"type": "quadratic", "a": -0.681, "b": 6.472, "c": -3.341},
+                1.7,
+                0.71,
+                0.009,
+                510,
+                "阔叶",
+                [5, 7, 9, 11],
+                0.40,
+                6,
+                1.10,
+            ),
+        ),
+        (
+            "槲栎",
+            original_species(
+                {"type": "power", "a": 2.449, "b": 0.932},
+                {"type": "linear", "a": 3.334, "b": 4.779},
+                2.2,
+                0.70,
+                0.009,
+                570,
+                "阔叶",
+                [5, 8, 11, 14],
+                0.68,
+                9,
+                1.48,
+            ),
+        ),
+        (
+            "栾树",
+            original_species(
+                {"type": "power", "a": 1.704, "b": 1.132},
+                {"type": "power", "a": 2.167, "b": 1.241},
+                2.0,
+                0.70,
+                0.009,
+                530,
+                "阔叶",
+                [5, 7, 9, 11],
+                0.58,
+                8,
+                1.32,
+            ),
+        ),
+        (
+            "加杨",
+            original_species(
+                {"type": "linear", "a": 1.161, "b": -0.216},
+                {"type": "linear", "a": 4.521, "b": 2.312},
+                2.3,
+                0.73,
+                0.009,
+                520,
+                "阔叶",
+                [6, 10, 14, 18],
+                0.52,
+                10,
+                1.42,
+            ),
+        ),
+        (
+            "柳树",
+            original_species(
+                {"type": "power", "a": 6.1479, "b": 0.439},
+                {"type": "quadratic", "a": 0.437, "b": -2.446, "c": 17.945},
+                2.4,
+                0.74,
+                0.009,
+                500,
+                "阔叶",
+                [4, 7, 10, 13],
+                0.48,
+                10,
+                1.35,
+            ),
+        ),
+        (
+            "白蜡",
+            original_species(
+                {"type": "inverse_log_power", "a": 0.3157, "b": 0.5624},
+                {"type": "log_power", "a": -0.0204, "b": 0.7253},
+                2.1,
+                0.70,
+                0.009,
+                540,
+                "阔叶",
+                [4, 7, 10, 13],
+                0.60,
+                9,
+                1.42,
+            ),
+        ),
+        (
+            "侧柏",
+            original_species(
+                {"type": "linear", "a": 1.377, "b": 2.307},
+                {"type": "quadratic", "a": 0.267, "b": 1.370, "c": 5.240},
+                2.9,
+                0.66,
+                0.012,
+                460,
+                "针叶",
+                [4, 7, 10, 13],
+                0.50,
+                7,
+                1.20,
+            ),
+        ),
+        (
+            "国槐",
+            original_species(
+                {"type": "power", "a": 4.524, "b": 0.593},
+                {"type": "quadratic", "a": -0.058, "b": 2.826, "c": 6.078},
+                2.0,
+                0.70,
+                0.009,
+                550,
+                "阔叶",
+                [5, 8, 11, 14],
+                0.64,
+                9,
+                1.44,
+            ),
+        ),
+    ]
+)
+
+KLIVE_LIST = [0.775, 0.700, 0.500, 0.450]
+KDEFECT_LIST = [0.915, 0.700, 0.500]
+OMEGA_LIST = [0.03, 0.075, 0.15, 0.30, 0.50]
+KBASE_LIST = [1.0, 0.8, 0.6]
+SITE_LIST = [0, 1]
+RAIN_CONFIG_LIST = [
+    {"kwet": 1.00, "fm": 1.00, "label": "干燥"},
+    {"kwet": 0.80, "fm": 0.68, "label": "小雨"},
+    {"kwet": 0.55, "fm": 0.35, "label": "暴雨"},
+]
+
+FIELDNAMES = [
+    "tree",
+    "H_m",
+    "klive",
+    "kdefect",
+    "omega",
+    "kbase",
+    "site",
+    "kwet",
+    "fm",
+    "rain_label",
+    "Cw_m",
+    "DBH_m",
+    "vcrit_mean",
+    "vcrit_gust",
+    "M_stem_resist_Nm",
+    "M_root_resist_Nm",
+    "failure_mode",
+    "gust_peak_8level",
+    "threshold_mean_for_8gust",
+    "eta_I0",
+    "gust_amplify",
+    "risk_status_8gust",
+]
+
+
+def solve_quadratic(a: float, b: float, c: float) -> float:
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        return 2.0
+    sqrt_d = math.sqrt(disc)
+    x1 = (-b + sqrt_d) / (2.0 * a)
+    x2 = (-b - sqrt_d) / (2.0 * a)
+    candidates = [x for x in (x1, x2) if 0.1 < x < 30.0]
+    if not candidates:
+        return max(x1, x2) if max(x1, x2) > 0 else 2.0
+    return min(candidates) if a < 0 else max(candidates)
+
+
+def calc_crown_param(height: float, tree_para: dict) -> tuple[float, float]:
+    dh = tree_para["dh"]
+    dc = tree_para["dc"]
+    if dh["type"] == "power":
+        dbh_cm = dh["a"] * (height ** dh["b"])
+    elif dh["type"] == "inverse_log_power":
+        dbh_cm = math.exp((math.log(height) - dh["a"]) / dh["b"])
+    else:
+        dbh_cm = dh["a"] * height + dh["b"]
+
+    if dc["type"] == "linear":
+        crown_width = (dbh_cm - dc["b"]) / dc["a"]
+    elif dc["type"] == "power":
+        crown_width = (dbh_cm / dc["a"]) ** (1.0 / dc["b"])
+    elif dc["type"] == "log":
+        crown_width = math.exp((dbh_cm - dc["b"]) / dc["a"])
+    elif dc["type"] == "log_power":
+        crown_width = math.exp(dc["a"] + dc["b"] * math.log(dbh_cm))
+    else:
+        crown_width = solve_quadratic(dc["a"], dc["b"], dc["c"] - dbh_cm)
+
+    crown_width = max(0.5, min(25.0, crown_width))
+    return crown_width, dbh_cm / 100.0
+
+
+def calc_wind_moment(
+    v_mean: float,
+    height: float,
+    crown_width: float,
+    dbh_m: float,
+    tree_para: dict,
+) -> float:
+    area = crown_width * 0.70 * height * tree_para["kcrown"] * 1.05
+    crown_depth = crown_width * 0.75
+    h_cg = 0.66 * height
+    base_sp = 1.0 - math.exp(-2.0 * crown_depth * tree_para["LAI"] / area)
+    if v_mean < 15.0:
+        eta_vent = 1.0
+    elif v_mean < 25.0:
+        eta_vent = 0.5 + 0.5 * base_sp
+    else:
+        eta_vent = base_sp
+    force = 0.5 * RHO_AIR * eta_vent * area * (v_mean**2)
+
+    dbh_cm = dbh_m * 100.0
+    n_iter = 3 if dbh_cm < 20.0 else (2 if dbh_cm < 35.0 else 1)
+    fi, hi = force, h_cg
+    # Retained from the supplied implementation so the requested revision is
+    # isolated to the stated root/base changes.
+    e_dummy = 1.0e9
+    for _ in range(n_iter):
+        delta_i = fi * (hi**3) / (3.0 * e_dummy)
+        alpha_i = math.atan(delta_i / hi)
+        fi = fi * math.cos(alpha_i)
+        hi = hi + delta_i
+
+    eta_crown = math.exp(-tree_para["beta"] * v_mean) if v_mean >= 25.0 else 1.0
+    return fi * eta_crown * hi
+
+
+def calc_stem_resistance(
+    dbh_m: float,
+    klive: float,
+    kdefect: float,
+    omega: float,
+    kbase: float,
+) -> float:
+    dbh_cm = dbh_m * 100.0
+    k_size = 0.85 if dbh_cm < 15.0 else (0.90 if dbh_cm < 30.0 else 0.95)
+    k_m = math.exp(-2.8 * omega)
+    sigma_eff = klive * kdefect * k_size * k_m * SIGMA_B0
+    dbh_base_m = 1.05 * dbh_m
+    eta_z = ETA_I0 * (1.0 - omega**2)
+    z = eta_z * math.pi * (dbh_m**3) / 32.0
+    z_base = eta_z * math.pi * (dbh_base_m**3) / 32.0
+    m_stem = sigma_eff * z
+    # kbase was present in the old factorial table but omitted from the old
+    # code path.  It applies only to the base check, matching the supplied
+    # model's base-effective-strength definition.
+    m_stem_base = sigma_eff * kbase * z_base
+    return min(m_stem, m_stem_base)
+
+
+def calc_root_resistance(
+    crown_width: float,
+    dbh_m: float,
+    site: int,
+    rain_config: dict,
+    tree_para: dict,
+) -> float:
+    root = tree_para["root"]
+    root_depth = root["root_depth"]
+    le = root_depth * root["L_eff_ratio"]
+    if site == 0:
+        ksyn = KSYN_OPEN
+        h_root = 0.5 * root_depth
+    else:
+        # R_root remains part of the uploaded species parameterization even
+        # though the force formula uses the revised equivalent lever arm.
+        _limited_root_radius = min(root["R_root"], crown_width * 0.45)
+        ksyn = KSYN_PAVED
+        h_root = 0.365 * root_depth
+
+    gamma_eff = 17000.0
+    mu_eff = 0.32
+    taproot_diameter = dbh_m
+    f_tap_side = (
+        0.5
+        * math.pi
+        * taproot_diameter
+        * gamma_eff
+        * mu_eff
+        * (le**2)
+    )
+    f_end = 0.25 * math.pi * (taproot_diameter**2) * gamma_eff * le
+    f_tap_total = f_tap_side + f_end
+
+    dbh_cm = dbh_m * 100.0
+    lateral_diameter_mm = max(
+        LATERAL_ROOT_DIAMETER_MIN_MM,
+        min(LATERAL_ROOT_DIAMETER_MAX_MM, dbh_cm * 2.2),
+    )
+    f_single_lateral = 15.22 * (lateral_diameter_mm**1.61)
+    f_lateral = ksyn * KSHEAR * root["n_side"] * f_single_lateral
+
+    # Baseline sequence: kwet once in root force, then the Eq. 33 sum.  The
+    # Fan (2022) fm lookup is a separate sensitivity scenario and is not
+    # compounded with the baseline kwet reduction.
+    f_root = (f_tap_total + f_lateral) * rain_config["kwet"]
+    m_root = f_root * h_root
+
+    # The supplied model gives this allometric equation as the preferred
+    # fallback when species-specific crown-mass coefficients are unavailable.
+    # The old code used rho*ellipsoid-volume while omitting the required crown
+    # fill factor lambda, effectively treating the entire crown envelope as
+    # solid wood and greatly overstating the stabilizing self-weight moment.
+    crown_mass = CROWN_MASS_ALLOMETRY_A * (dbh_cm**CROWN_MASS_ALLOMETRY_B)
+    m_weight = crown_mass * GRAVITY * h_root
+    m_equation_33 = m_root + m_weight
+    return m_equation_33
+
+
+def solve_critical_v(
+    height: float,
+    tree_para: dict,
+    klive: float,
+    kdefect: float,
+    omega: float,
+    kbase: float,
+    site: int,
+    rain_config: dict,
+) -> tuple[float, float, str, float, float, float, float]:
+    crown_width, dbh_m = calc_crown_param(height, tree_para)
+    stem_r = calc_stem_resistance(dbh_m, klive, kdefect, omega, kbase)
+    root_r = calc_root_resistance(crown_width, dbh_m, site, rain_config, tree_para)
+    resistance = min(stem_r, root_r)
+
+    # The supplied script stopped at 40 m/s, which censored very resistant
+    # combinations.  Expand the bracket before bisection so reported critical
+    # speeds are actual roots rather than the old search ceiling.
+    v_low, v_high = 0.0, 40.0
+    while (
+        calc_wind_moment(v_high, height, crown_width, dbh_m, tree_para) < resistance
+        and v_high < 160.0
+    ):
+        v_high *= 2.0
+    if v_high > 160.0:
+        v_high = 160.0
+    for _ in range(60):
+        v_mid = 0.5 * (v_low + v_high)
+        wind_moment = calc_wind_moment(v_mid, height, crown_width, dbh_m, tree_para)
+        if wind_moment < resistance:
+            v_low = v_mid
+        else:
+            v_high = v_mid
+    v_mean = 0.5 * (v_low + v_high)
+    v_gust = v_mean * GUST_AMPLIFICATION_FACTOR
+    failure_mode = "stem_fracture" if stem_r < root_r else "root_overturn"
+    return v_mean, v_gust, failure_mode, stem_r, root_r, crown_width, dbh_m
+
+
+def generate_rows() -> list[dict]:
+    rows: list[dict] = []
+    for tree_name, tree_para in TREE_PARAMS.items():
+        for height in tree_para["H_list"]:
+            for klive in KLIVE_LIST:
+                for kdefect in KDEFECT_LIST:
+                    for omega in OMEGA_LIST:
+                        for kbase in KBASE_LIST:
+                            for site in SITE_LIST:
+                                for rain in RAIN_CONFIG_LIST:
+                                    (
+                                        v_mean,
+                                        v_gust,
+                                        failure_mode,
+                                        stem_r,
+                                        root_r,
+                                        crown_width,
+                                        dbh_m,
+                                    ) = solve_critical_v(
+                                        height,
+                                        tree_para,
+                                        klive,
+                                        kdefect,
+                                        omega,
+                                        kbase,
+                                        site,
+                                        rain,
+                                    )
+                                    rows.append(
+                                        {
+                                            "tree": tree_name,
+                                            "H_m": height,
+                                            "klive": klive,
+                                            "kdefect": kdefect,
+                                            "omega": omega,
+                                            "kbase": kbase,
+                                            "site": site,
+                                            "kwet": rain["kwet"],
+                                            "fm": rain["fm"],
+                                            "rain_label": rain["label"],
+                                            "Cw_m": round(crown_width, 4),
+                                            "DBH_m": round(dbh_m, 6),
+                                            "vcrit_mean": round(v_mean, 4),
+                                            "vcrit_gust": round(v_gust, 4),
+                                            "M_stem_resist_Nm": round(stem_r, 2),
+                                            "M_root_resist_Nm": round(root_r, 2),
+                                            "failure_mode": failure_mode,
+                                            "gust_peak_8level": GUST_PEAK_8LEVEL,
+                                            "threshold_mean_for_8gust": round(
+                                                THRESHOLD_MEAN, 4
+                                            ),
+                                            "eta_I0": ETA_I0,
+                                            "gust_amplify": GUST_AMPLIFICATION_FACTOR,
+                                            "risk_status_8gust": (
+                                                "fail"
+                                                if v_mean <= THRESHOLD_MEAN
+                                                else "safe"
+                                            ),
+                                        }
+                                    )
+    return rows
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[1]
+    out_dir = root / "outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = out_dir / "tree_wind_modified_formula33_56160.csv"
+    audit_json = out_dir / "tree_wind_modified_formula33_audit.json"
+
+    rows = generate_rows()
+    expected = 13 * 4 * 4 * 3 * 5 * 3 * 2 * 3
+    if len(rows) != expected:
+        raise RuntimeError(f"row-count mismatch: {len(rows)} != {expected}")
+
+    with out_csv.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    audit = {
+        "rows": len(rows),
+        "columns": FIELDNAMES,
+        "species": list(TREE_PARAMS),
+        "expected_rows_formula": "13*4*4*3*5*3*2*3",
+        "root_revision": {
+            "kshear": KSHEAR,
+            "ksyn_open": KSYN_OPEN,
+            "ksyn_paved": KSYN_PAVED,
+            "lateral_root_diameter_mm": [
+                LATERAL_ROOT_DIAMETER_MIN_MM,
+                LATERAL_ROOT_DIAMETER_MAX_MM,
+            ],
+            "end_bearing_included": True,
+            "sequence": "Froot=(Ftap+Flateral)*kwet; M33=Mroot+Mweight",
+            "kwet_count": 1,
+            "fm_count": 0,
+            "fm_role": "reference-only column; equation 29 sensitivity is not compounded with baseline equation 30",
+        },
+        "crown_mass_revision": {
+            "formula": "m_kg=0.12*DBH_cm^2.18",
+            "reason": "preferred fallback in supplied model; replaces rho*ellipsoid volume with omitted fill factor lambda",
+        },
+        "stem_revision": "kbase applied once to the base-section capacity check",
+        "healthy_definition": {
+            "klive": max(KLIVE_LIST),
+            "kdefect": max(KDEFECT_LIST),
+            "omega": min(OMEGA_LIST),
+            "kbase": max(KBASE_LIST),
+        },
+        "white_ash_assumption": {
+            "heights_m": TREE_PARAMS["白蜡"]["H_list"],
+            "geometry": "Fraxinus chinensis 95th-quantile ln allometry; user-referenced image unavailable",
+            "mechanical_and_root_inputs": "medians/representative values from supplied broad-leaved species",
+        },
+        "calibration": {
+            "target_definition": "root_overturn failures / all 8-level-gust failures",
+            "target_share_range": [0.30, 0.50],
+            "failed_rows": sum(
+                row["risk_status_8gust"] == "fail" for row in rows
+            ),
+            "root_overturn_failures": sum(
+                row["risk_status_8gust"] == "fail"
+                and row["failure_mode"] == "root_overturn"
+                for row in rows
+            ),
+        },
+        "literature_basis": [
+            {
+                "source": "Cannon, Barrett & Peterson (2015)",
+                "doi": "10.1016/j.foreco.2015.07.014",
+                "finding": "uprooting was 45% for Pinus and 50% for other hardwoods in static winching tests",
+            },
+            {
+                "source": "Moore (2000)",
+                "doi": "10.1016/S0378-1127(00)00298-X",
+                "finding": "uprooting incidence varied from 11% on clay to 92% on non-cohesive soils",
+            },
+            {
+                "source": "Cohen, Schwarz & Or (2011)",
+                "doi": "10.1029/2010JF001886",
+                "finding": "root diameter distribution and progressive bundle failure materially affect peak pullout force",
+            },
+        ],
+    }
+    failed_rows = audit["calibration"]["failed_rows"]
+    root_failures = audit["calibration"]["root_overturn_failures"]
+    audit["calibration"]["observed_root_share"] = (
+        root_failures / failed_rows if failed_rows else None
+    )
+    audit["calibration"]["within_target"] = (
+        failed_rows > 0
+        and 0.30 <= audit["calibration"]["observed_root_share"] <= 0.50
+    )
+    audit_json.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"csv": str(out_csv), "audit": str(audit_json), "rows": len(rows)}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
